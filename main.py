@@ -1,8 +1,10 @@
+#!/usr/bin/env python3
 import argparse
 import random
 import select
 import socket
 import struct
+import sys
 import time
 
 DNS_Q = (
@@ -30,11 +32,51 @@ def make_tcp(src_ip, dst_ip, src_port, dst_port, flags, seq=0):
     return struct.pack("!HHLLBBHHH", src_port, dst_port, seq, 0, 5 << 4, flags, 5840, cs, 0)
 
 
+def parse_targets(targets):
+    tcp_ports = set()
+    udp_ports = set()
+
+    for t in targets:
+        if "/" in t:
+            proto, raw = t.split("/", 1)
+            if not raw:
+                sys.exit(1)
+            ports = []
+            for part in raw.split(","):
+                try:
+                    if "-" in part:
+                        a, b = map(int, part.split("-", 1))
+                        if a > b or not (1 <= a <= 65535 and 1 <= b <= 65535):
+                            sys.exit(1)
+                        ports.extend(range(a, b + 1))
+                    else:
+                        p = int(part)
+                        if not (1 <= p <= 65535):
+                            sys.exit(1)
+                        ports.append(p)
+                except ValueError:
+                    sys.exit(1)
+        else:
+            proto = t
+            ports = range(1, 65536)
+
+        if proto.lower() == "tcp":
+            tcp_ports.update(ports)
+        elif proto.lower() == "udp":
+            udp_ports.update(ports)
+        else:
+            sys.exit(1)
+
+    return sorted(tcp_ports), sorted(udp_ports)
+
+
 def scan_tcp(ip, ports, timeout):
-    tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    tmp.connect((ip, 80))
-    my_ip = tmp.getsockname()[0]
-    tmp.close()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tmp:
+        try:
+            tmp.connect((ip, 80))
+            my_ip = tmp.getsockname()[0]
+        except OSError:
+            my_ip = "127.0.0.1"
 
     src_port = random.randint(40000, 60000)
     s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
@@ -48,8 +90,11 @@ def scan_tcp(ip, ports, timeout):
 
         for p in batch:
             pkt = make_tcp(my_ip, ip, src_port, p, 0x02)
-            s.sendto(pkt, (ip, 0))
-            times[p] = time.time()
+            try:
+                s.sendto(pkt, (ip, 0))
+                times[p] = time.time()
+            except OSError:
+                pending.discard(p)
 
         end = time.time() + timeout
         while pending:
@@ -60,9 +105,15 @@ def scan_tcp(ip, ports, timeout):
             if not r:
                 break
 
-            data, _ = s.recvfrom(65535)
+            try:
+                data, _ = s.recvfrom(65535)
+            except OSError:
+                continue
+
+            if len(data) < 40:
+                continue
             ihl = (data[0] & 0x0F) * 4
-            if socket.inet_ntoa(data[12:16]) != ip:
+            if len(data) < ihl + 14 or socket.inet_ntoa(data[12:16]) != ip:
                 continue
 
             sp, dp, seq, ack, _, flags = struct.unpack("!HHLLBB", data[ihl : ihl + 14])
@@ -73,7 +124,10 @@ def scan_tcp(ip, ports, timeout):
                 opened[sp] = (time.time() - times[sp]) * 1000
                 pending.remove(sp)
                 rst = make_tcp(my_ip, ip, src_port, sp, 0x04, ack)
-                s.sendto(rst, (ip, 0))
+                try:
+                    s.sendto(rst, (ip, 0))
+                except OSError:
+                    pass
             elif flags & 0x04:
                 pending.remove(sp)
 
@@ -95,7 +149,10 @@ def scan_udp(ip, ports, timeout):
         closed = set()
 
         for p in batch:
-            udp.sendto(b"\x00", (ip, p))
+            try:
+                udp.sendto(b"\x00", (ip, p))
+            except OSError:
+                closed.add(p)
 
         end = time.time() + timeout
         while True:
@@ -107,13 +164,17 @@ def scan_udp(ip, ports, timeout):
                 break
 
             for sock in r:
-                data, _ = sock.recvfrom(65535)
-                if sock == icmp:
+                try:
+                    data, _ = sock.recvfrom(65535)
+                except OSError:
+                    continue
+
+                if sock == icmp and len(data) >= 28:
                     ihl = (data[0] & 0x0F) * 4
-                    if data[ihl] == 3 and data[ihl + 1] == 3:
+                    if len(data) >= ihl + 28 and data[ihl] == 3 and data[ihl + 1] == 3:
                         inner = ihl + 8
                         inner_ihl = (data[inner] & 0x0F) * 4
-                        if socket.inet_ntoa(data[inner + 16 : inner + 20]) == ip:
+                        if len(data) >= inner + inner_ihl + 4 and socket.inet_ntoa(data[inner + 16 : inner + 20]) == ip:
                             _, dport = struct.unpack("!HH", data[inner + inner_ihl : inner + inner_ihl + 4])
                             closed.add(dport)
 
@@ -128,39 +189,34 @@ def scan_udp(ip, ports, timeout):
 
 def guess_tcp(ip, port, timeout):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((ip, port))
-        s.sendall(f"GET / HTTP/1.0\r\nHost: {ip}\r\n\r\n".encode())
-        resp = s.recv(1024)
-        s.close()
-        if resp.startswith(b"HTTP/"):
-            return "HTTP"
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((ip, port))
+            s.sendall(f"GET / HTTP/1.0\r\nHost: {ip}\r\n\r\n".encode())
+            if s.recv(1024).startswith(b"HTTP/"):
+                return "HTTP"
+    except OSError:
         pass
 
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((ip, port))
-        s.sendall(b"hello\r\n")
-        resp = s.recv(1024)
-        s.close()
-        if b"hello" in resp:
-            return "ECHO"
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((ip, port))
+            s.sendall(b"hello\r\n")
+            if b"hello" in s.recv(1024):
+                return "ECHO"
+    except OSError:
         pass
 
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((ip, port))
-        s.sendall(struct.pack("!H", len(DNS_Q)) + DNS_Q)
-        resp = s.recv(1024)
-        s.close()
-        if resp[2:4] == b"\x12\x34":
-            return "DNS"
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((ip, port))
+            s.sendall(struct.pack("!H", len(DNS_Q)) + DNS_Q)
+            resp = s.recv(1024)
+            if len(resp) >= 4 and resp[2:4] == b"\x12\x34":
+                return "DNS"
+    except OSError:
         pass
 
     return "-"
@@ -168,25 +224,23 @@ def guess_tcp(ip, port, timeout):
 
 def guess_udp(ip, port, timeout):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-        s.sendto(b"hello", (ip, port))
-        resp, _ = s.recvfrom(1024)
-        s.close()
-        if b"hello" in resp:
-            return "ECHO"
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(b"hello", (ip, port))
+            resp, _ = s.recvfrom(1024)
+            if b"hello" in resp:
+                return "ECHO"
+    except OSError:
         pass
 
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-        s.sendto(DNS_Q, (ip, port))
-        resp, _ = s.recvfrom(1024)
-        s.close()
-        if resp[:2] == b"\x12\x34":
-            return "DNS"
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(DNS_Q, (ip, port))
+            resp, _ = s.recvfrom(1024)
+            if len(resp) >= 2 and resp[:2] == b"\x12\x34":
+                return "DNS"
+    except OSError:
         pass
 
     return "-"
@@ -198,34 +252,21 @@ parser.add_argument("-j", "--num-threads", type=int, default=1)
 parser.add_argument("-v", "--verbose", action="store_true")
 parser.add_argument("-g", "--guess", action="store_true")
 parser.add_argument("ip")
-parser.add_argument("targets", nargs="*")
+parser.add_argument("targets", nargs="+")
 args = parser.parse_args()
 
-tcp_ports = set()
-udp_ports = set()
-for t in args.targets:
-    if "/" in t:
-        proto, raw = t.split("/")
-        ports = []
-        for part in raw.split(","):
-            if "-" in part:
-                a, b = part.split("-")
-                ports.extend(range(int(a), int(b) + 1))
-            else:
-                ports.append(int(part))
-    else:
-        proto = t
-        ports = range(1, 65536)
+if args.timeout <= 0 or args.num_threads < 1:
+    sys.exit(1)
 
-    if proto.lower() == "tcp":
-        tcp_ports.update(ports)
-    elif proto.lower() == "udp":
-        udp_ports.update(ports)
+try:
+    ip = socket.gethostbyname(args.ip)
+except socket.gaierror:
+    sys.exit(1)
 
-ip = socket.gethostbyname(args.ip)
+tcp_ports, udp_ports = parse_targets(args.targets)
 
 if tcp_ports:
-    res = scan_tcp(ip, sorted(tcp_ports), args.timeout)
+    res = scan_tcp(ip, tcp_ports, args.timeout)
     for p in sorted(res):
         out = f"TCP {p}"
         if args.verbose:
@@ -235,7 +276,7 @@ if tcp_ports:
         print(out)
 
 if udp_ports:
-    res = scan_udp(ip, sorted(udp_ports), args.timeout)
+    res = scan_udp(ip, udp_ports, args.timeout)
     for p in sorted(res):
         out = f"UDP {p}"
         if args.guess:
