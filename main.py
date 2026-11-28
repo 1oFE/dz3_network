@@ -11,8 +11,6 @@ DNS_Q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00
 
 
 def checksum(data):
-    if len(data) % 2:
-        data += b"\x00"
     s = 0
     for i in range(0, len(data), 2):
         s += (data[i] << 8) + data[i + 1]
@@ -56,10 +54,8 @@ def scan_tcp(ip, ports, timeout):
                 break
             data, _ = s.recvfrom(65535)
             ihl = (data[0] & 0x0F) * 4
-            if len(data) < ihl + 14 or socket.inet_ntoa(data[12:16]) != ip:
-                continue
             src_p, dst_p, _, ack, _, flags = struct.unpack("!HHLLBB", data[ihl : ihl + 14])
-            if dst_p != sp or src_p not in pending:
+            if dst_p != sp:
                 continue
             if flags & 0x12 == 0x12:
                 opened[src_p] = (time.time() - times[src_p]) * 1000
@@ -78,8 +74,8 @@ def scan_udp(ip, ports, timeout):
     icmp.setblocking(False)
     opened = []
 
-    for i in range(0, len(ports), 100):
-        batch = ports[i : i + 100]
+    for i in range(0, len(ports), 200):
+        batch = ports[i : i + 200]
         closed = set()
         for p in batch:
             try:
@@ -170,9 +166,9 @@ try:
                 if p < 1 or p > 65535:
                     sys.exit(1)
                 ports.append(p)
-        if proto.lower() == "tcp":
+        if proto == "tcp":
             tcp_ports.update(ports)
-        elif proto.lower() == "udp":
+        elif proto == "udp":
             udp_ports.update(ports)
         else:
             sys.exit(1)
@@ -184,7 +180,7 @@ if tcp_ports:
     for p in sorted(res):
         line = f"TCP {p}"
         if args.verbose:
-            line += f" {res[p]:.1f}"
+            line += f" {res[p]:.3f}"
         if args.guess:
             line += f" {guess(True, ip, p, args.timeout)}"
         print(line)
